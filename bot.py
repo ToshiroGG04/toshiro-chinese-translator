@@ -1,10 +1,15 @@
+
 import os
+import json
+import time
 import logging
 import tempfile
 import subprocess
-import time
+import urllib.request
+import urllib.error
 from pathlib import Path
 from functools import lru_cache
+from urllib.parse import urlencode
 
 from telegram import Update
 from telegram.ext import (
@@ -14,7 +19,6 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from deep_translator import GoogleTranslator
 from pypinyin import pinyin, Style
 from gtts import gTTS
 import speech_recognition as sr
@@ -39,59 +43,93 @@ def make_pinyin(chinese_text: str) -> str:
 
 
 @lru_cache(maxsize=500)
-def _translate_cached(text: str) -> str:
-    return GoogleTranslator(
-        source="auto",
-        target="zh-CN",
-    ).translate(text)
-
-
 def translate_to_chinese(text: str) -> str:
     text = text.strip()
 
+    if not text:
+        raise ValueError("Walay text nga i-translate.")
+
+    if len(text) > 3000:
+        raise ValueError("Hangtod 3000 characters lang kada translation.")
+
+    query = urlencode({"to_lang": "zh"})
+    url = f"https://uapis.cn/api/v1/translate/text?{query}"
+
+    payload = json.dumps({"text": text}).encode("utf-8")
+
+    request = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "TOSHIRO-Chinese-Translator/1.0",
+        },
+        method="POST",
+    )
+
+    last_error = None
+
     for attempt in range(3):
         try:
-            result = _translate_cached(text)
+            with urllib.request.urlopen(
+                request,
+                timeout=30,
+            ) as response:
+                result = json.loads(
+                    response.read().decode("utf-8")
+                )
 
-            if not result:
-                raise ValueError("Walay translation result")
+            chinese = result.get("translate")
 
-            return result
+            if not isinstance(chinese, str) or not chinese.strip():
+                raise RuntimeError(
+                    "Walay translation sa tubag sa API."
+                )
 
-        except Exception as exc:
-            error_name = type(exc).__name__.lower()
-            error_text = str(exc).lower()
+            return chinese.strip()
 
-            limited = (
-                "toomanyrequests" in error_name
-                or "429" in error_text
-                or "too many requests" in error_text
-            )
+        except urllib.error.HTTPError as exc:
+            last_error = exc
 
-            if not limited or attempt == 2:
-                raise
+            if exc.code not in (429, 500, 502, 503, 504):
+                raise RuntimeError(
+                    f"Translation API error: HTTP {exc.code}"
+                ) from exc
 
-            # Retry after a short delay if the service is rate-limited.
-            time.sleep(2 ** (attempt + 1))
+            if attempt < 2:
+                time.sleep(2 ** (attempt + 1))
 
-    raise RuntimeError("Napakyas ang translation.")
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            json.JSONDecodeError,
+        ) as exc:
+            last_error = exc
+
+            if attempt < 2:
+                time.sleep(2 ** (attempt + 1))
+
+    raise RuntimeError(
+        "Dili ma-access ang translation service, "
+        "o nahurot ang available credits. "
+        "Sulayi pag-usab unya."
+    ) from last_error
 
 
 async def start(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    message = (
+    await update.message.reply_text(
         "👋 Welcome sa TOSHIRO Chinese Translator! 🇨🇳\n\n"
         "I-type ang English o Bisaya sentence aron i-translate "
-        ngadto sa Chinese.\n"
+        "ngadto sa Chinese.\n"
         "Pwede usab magpadala og English voice message.\n\n"
         "Example: Hi, how are you?\n\n"
-        "Commands:\n"
         "/start - Sugod\n"
         "/help - Tabang"
     )
-    await update.message.reply_text(message)
 
 
 async def help_command(
@@ -101,7 +139,7 @@ async def help_command(
     await update.message.reply_text(
         "📝 I-type ang sentence nga gusto nimo i-translate.\n"
         "🇨🇳 Makadawat ka og Chinese characters ug pinyin.\n"
-        "🔊 Magpadala usab ang bot og Chinese pronunciation audio.\n"
+        "🔊 Magpadala usab ang bot og Chinese audio.\n"
         "🎙️ Pwede magpadala og English voice message.\n\n"
         "Pahinumdom: Ang Bisaya voice recognition mahimong dili sakto."
     )
@@ -152,8 +190,8 @@ async def send_translation(update: Update, text: str):
         log.exception("Translation failed")
         await update.message.reply_text(
             "Pasayloa, napakyas ang translation karon.\n"
-            "Sulayi pag-usab unya.\n"
-            f"Error: {type(exc).__name__}"
+            f"Detalye: {type(exc).__name__}\n\n"
+            "Sulayi pag-usab unya."
         )
 
 
@@ -183,8 +221,8 @@ async def voice_message(
         with tempfile.NamedTemporaryFile(
             suffix=".ogg",
             delete=False,
-        ) as audio_file:
-            ogg_path = audio_file.name
+        ) as audio:
+            ogg_path = audio.name
 
         await telegram_file.download_to_drive(ogg_path)
 
@@ -192,15 +230,8 @@ async def voice_message(
 
         result = subprocess.run(
             [
-                "ffmpeg",
-                "-y",
-                "-i",
-                ogg_path,
-                "-ar",
-                "16000",
-                "-ac",
-                "1",
-                wav_path,
+                "ffmpeg", "-y", "-i", ogg_path,
+                "-ar", "16000", "-ac", "1", wav_path,
             ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -228,20 +259,19 @@ async def voice_message(
 
     except sr.UnknownValueError:
         await status.edit_text(
-            "Wala nako masabti ang imong tingog.\n"
+            "Wala nako masabti ang tingog. "
             "Sulayi og klaro nga English voice message "
-            "o i-type lang ang sentence."
+            "o i-type ang sentence."
         )
 
     except sr.RequestError:
         await status.edit_text(
-            "Dili ma-access ang speech recognition karon. "
-            "Sulayi pag-usab."
+            "Dili ma-access ang speech recognition karon."
         )
 
     except FileNotFoundError:
         await status.edit_text(
-            "Wala ang FFmpeg sa server. Kinahanglan kini "
+            "Kinahanglan ang FFmpeg sa hosting server "
             "aron maproseso ang voice messages."
         )
 
