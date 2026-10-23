@@ -1,0 +1,1 @@
+# toshiro-chinese-translator
